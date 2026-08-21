@@ -102,13 +102,13 @@ usage() {
 
 Usage:
   $SCRIPT_NAME init <owner>/<repository>         Set up a bare worktree repo in the current empty directory
-                                          (a full git URL works too)
+                                          (a full git URL works too) and scaffold .wtree/config.json
   $SCRIPT_NAME add <worktree> [options]          Create a worktree. Checks out origin/<worktree> if it
                                           exists, otherwise branches off main/master
-                                          and runs the post-add hook when there is one
+                                          and runs the pre-add / post-add hooks
       -c, --custom-branch <branch>        Base the new branch on <branch> instead
       -p, --print-path                    Print only the worktree path on stdout
-          --no-hooks                      Skip the post-add hook for this run
+          --no-hooks                      Skip both hooks for this run
   $SCRIPT_NAME remove <worktree> [options]       Remove a worktree and delete its local branch
       -f, --force                         Remove even if dirty / delete an unmerged branch
   $SCRIPT_NAME ls | list                         Show worktrees with branch, dirty and ahead/behind state
@@ -152,17 +152,24 @@ Usage:
   $SCRIPT_NAME help                              Show this message
 
 Hooks:
-  <repo-root>/.wtree/config.json defines commands to run after a worktree is
-  created. Each action runs from the root of the new worktree and is timed; a
-  failing one is reported at the end and the rest still run. Needs jq.
+  <repo-root>/.wtree/config.json defines commands to run around 'add'. Actions
+  are timed, and a failing one is reported at the end while the rest still run.
+  'init' writes the file with both hooks empty. Needs jq.
+
+    pre-add    runs from the repo root, before anything is created.
+               If an action fails, the worktree is not created.
+    post-add   runs from the root of the new worktree.
+               Failures are reported, never rolled back.
+
+  Each action gets \$WTREE_EVENT, \$WTREE_NAME, \$WTREE_BRANCH, \$WTREE_PATH and
+  \$WTREE_ROOT, and starts in its own subshell, so a 'cd' never leaks onwards.
 
   {
     "hooks": {
-      "post-add": {
-        "actions": [
-          { "type": "bash", "command": "pnpm install" }
-        ]
-      }
+      "pre-add":  { "actions": [] },
+      "post-add": { "actions": [
+        { "type": "bash", "command": "pnpm install" }
+      ] }
     }
   }
 EOF
@@ -334,13 +341,32 @@ sync_label() {
 }
 
 # Every event a .wtree/config.json may define, so a typo can be pointed at
-HOOK_EVENTS="post-add"
+HOOK_EVENTS="pre-add post-add"
 
-# The config is repo-level: it sits next to .bare and is shared by every worktree
-hook_config_file() {
-    local root
-    root=$(repo_root) || return 1
-    echo "$root/.wtree/config.json"
+# The scaffold 'init' leaves behind: the shape of the file, with nothing in it
+hook_config_template() {
+    cat <<'EOF'
+{
+  "hooks": {
+    "pre-add": {
+      "actions": []
+    },
+    "post-add": {
+      "actions": []
+    }
+  }
+}
+EOF
+}
+
+# One action, in a subshell of its own, so both its cd and the exported context
+# die with it and the next action starts from a clean slate
+hook_run_action() {
+    (
+        cd "$1" || exit 1
+        export WTREE_EVENT WTREE_NAME WTREE_BRANCH WTREE_PATH WTREE_ROOT
+        exec bash -c "$2"
+    )
 }
 
 # A command rendered as one trimmed line, for the progress column
@@ -365,31 +391,40 @@ hook_warn_unknown() {
     done < <(jq -r '.hooks | if type == "object" then keys[] else empty end' "$cfg" 2>/dev/null)
 }
 
-# run_hooks <event> <worktree-path>
+# run_hooks <event> <cwd> <name> <branch> <worktree-path>
 #
-# Actions run in order, each in its own subshell rooted at the worktree, so a
-# 'cd' in one never leaks into the next - every command starts from the worktree
-# root. A failing action is recorded and the remaining ones still run, since one
-# broken step shouldn't skip the rest of the setup; the failures are listed at
-# the end. Returns 1 if anything failed or the config could not be read.
+# Actions run in order, each in its own subshell rooted at <cwd>, so a 'cd' in
+# one never leaks into the next - every command starts from the same place. The
+# worktree does not exist yet during pre-add, which is why the caller picks the
+# directory rather than this function assuming one.
+#
+# A failing action is recorded and the remaining ones still run, so one broken
+# step can neither skip the rest of the setup nor hide a second problem behind
+# the first; the failures are listed at the end.
+#
+# Returns 0 when everything passed or there was nothing to do, 1 when an action
+# failed, and 2 when the config itself could not be read. The caller needs those
+# apart: a failed action gates 'add', a missing jq should not.
 run_hooks() {
-    local event=$1 path=$2 cfg count i n action_type cmd label rc
+    local event=$1 cwd=$2 name=$3 branch=$4 path=$5
+    local root cfg count i n action_type cmd label rc
     local started t0 dur indent
     local -a failed=()
 
-    cfg=$(hook_config_file) || return 0
+    root=$(repo_root) || return 0
+    cfg="$root/.wtree/config.json"
     [ -f "$cfg" ] || return 0
 
     if ! command -v jq >/dev/null 2>&1; then
         echo "⚠️  $cfg exists but jq is not installed - skipping hooks." >&2
         echo "   Install jq to run them." >&2
-        return 1
+        return 2
     fi
 
     if ! jq -e 'type == "object"' "$cfg" >/dev/null 2>&1; then
         echo "⚠️  $cfg is not a JSON object - skipping hooks." >&2
         jq '.' "$cfg" >/dev/null # jq reports its own parse error, if that is the problem
-        return 1
+        return 2
     fi
 
     hook_warn_unknown "$cfg"
@@ -401,8 +436,16 @@ run_hooks() {
     # prefix is padded to a fixed width and matched by an indent of the same size
     printf -v indent '%*s' "$((2 * ${#count} + 6))" ''
 
+    # Plain shell variables here, exported only inside each action's subshell, so
+    # nothing leaks into the git commands wtree runs around the hook
+    WTREE_EVENT=$event
+    WTREE_NAME=$name
+    WTREE_BRANCH=$branch
+    WTREE_PATH=$path
+    WTREE_ROOT=$root
+
     started=$SECONDS
-    sayf '\n🪝 %s - running %d action(s) in %s' "$event" "$count" "$path"
+    sayf '\n🪝 %s - running %d action(s) in %s' "$event" "$count" "$cwd"
 
     for ((i = 0; i < count; i++)); do
         n=$((i + 1))
@@ -429,9 +472,9 @@ run_hooks() {
         # With -p the caller is capturing stdout, so an action's own output
         # must not land there either
         if [ "$QUIET_STDOUT" -eq 1 ]; then
-            (cd "$path" && exec bash -c "$cmd") >&2
+            hook_run_action "$cwd" "$cmd" >&2
         else
-            (cd "$path" && exec bash -c "$cmd")
+            hook_run_action "$cwd" "$cmd"
         fi
         rc=$?
         dur=$((SECONDS - t0))
@@ -491,12 +534,20 @@ cmd_init() {
     git fetch --all
     git remote set-head origin --auto >/dev/null 2>&1
 
+    # An empty hook list is far easier to extend than a file you have to know
+    # exists before you can write it
+    if [ ! -e .wtree/config.json ]; then
+        mkdir -p .wtree
+        hook_config_template >.wtree/config.json
+        echo "🪝 Wrote .wtree/config.json - fill in the hooks to set new worktrees up"
+    fi
+
     echo "✅ Setup complete!"
     echo "Next step: $SCRIPT_NAME add $(default_branch || echo main)"
 }
 
 cmd_add() {
-    local name="" base="" print_path=0 hooks=1 hooks_rc=0 path branch start
+    local name="" base="" print_path=0 hooks=1 hooks_rc=0 path branch start root rc
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -532,6 +583,17 @@ cmd_add() {
 
     path=$(worktree_path "$name")
     branch=$(worktree_branch "$name")
+    root=$(repo_root)
+
+    # Before wtree does anything of its own, so a gate that says no costs nothing.
+    # Only a failed action stops us - an unreadable config (rc 2) is the user's
+    # problem to fix, not a reason to refuse them a worktree.
+    if [ "$hooks" -eq 1 ]; then
+        run_hooks pre-add "$root" "$name" "$branch" "$path"
+        rc=$?
+        [ "$rc" -eq 1 ] && die "pre-add hook failed - worktree not created." \
+            "Fix the actions above, or re-run with --no-hooks to skip them."
+    fi
 
     say "📡 Fetching latest refs..."
     git fetch origin --quiet || say "⚠️  Fetch failed, continuing with local refs."
@@ -566,7 +628,7 @@ cmd_add() {
     say "✅ Worktree ready: $path"
 
     # The worktree exists either way - a failing hook is reported, never undone
-    [ "$hooks" -eq 1 ] && { run_hooks post-add "$path" || hooks_rc=1; }
+    [ "$hooks" -eq 1 ] && { run_hooks post-add "$path" "$name" "$branch" "$path" || hooks_rc=1; }
 
     [ "$print_path" -eq 1 ] && echo "$path"
     return "$hooks_rc"

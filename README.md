@@ -50,7 +50,7 @@ the repo and every subdirectory is a worktree:
 acme/
 ├── .bare/            the bare clone — all git objects live here
 ├── .git              file containing "gitdir: ./.bare"
-├── .wtree/           optional: config.json and any files your hooks copy around
+├── .wtree/           config.json for hooks, plus any files they copy around
 ├── main/             worktree on branch main
 ├── feature/login/    worktree on branch feature/login
 └── spike-caching/    worktree on branch spike-caching
@@ -72,14 +72,16 @@ wtree cd feature/login
 ```
 
 `init` refuses to run in a non-empty directory (the `wtree` script itself is allowed to
-sit there), which keeps the layout above intact.
+sit there), which keeps the layout above intact. It also drops a `.wtree/config.json` with
+both [hooks](#hooks) present and empty, so setting worktrees up is a matter of filling in a
+list rather than knowing a file you have to create first.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `wtree init <owner>/<repo>` | Bare-clone into the current empty directory and wire up remote tracking |
-| `wtree add <worktree>` | Create a worktree. Checks out `origin/<worktree>` if it exists, otherwise branches off main/master, then runs the `post-add` [hook](#hooks) |
+| `wtree init <owner>/<repo>` | Bare-clone into the current empty directory, wire up remote tracking and scaffold `.wtree/config.json` |
+| `wtree add <worktree>` | Create a worktree. Checks out `origin/<worktree>` if it exists, otherwise branches off main/master, running the `pre-add` and `post-add` [hooks](#hooks) around it |
 | `wtree remove <worktree>` | Remove a worktree and delete its local branch |
 | `wtree ls` \| `list` | Table of worktrees with branch, dirty state and ahead/behind counts |
 | `wtree sync [<worktree>]` | Fetch, then fast-forward one worktree — or all of them |
@@ -100,7 +102,7 @@ sit there), which keeps the layout above intact.
 wtree add <worktree> [-c <branch>] [-p] [--no-hooks]
   -c, --custom-branch <branch>   Base the new branch on <branch> instead of main/master
   -p, --print-path               Print only the worktree path on stdout
-      --no-hooks                 Skip the post-add hook for this run
+      --no-hooks                 Skip both hooks for this run
 ```
 
 Three cases, in order: if the branch already exists locally it is checked out (and wired
@@ -212,11 +214,16 @@ files, no local certificates — the things a `git clone` never carries. Hooks a
 commands that close that gap, run for you every time `wtree add` creates a worktree.
 
 They live in `<repo-root>/.wtree/config.json`, next to `.bare`, so every worktree in the
-setup shares one copy:
+setup shares one copy. `wtree init` writes it for you with both hooks empty:
 
 ```json
 {
   "hooks": {
+    "pre-add": {
+      "actions": [
+        { "type": "bash", "command": "test -f .wtree/secrets/.env" }
+      ]
+    },
     "post-add": {
       "actions": [
         { "type": "bash", "command": "cp ../.wtree/secrets/.env ./.env" },
@@ -231,11 +238,37 @@ setup shares one copy:
 `.wtree/` is a good home for the files the hook hands out, too — certificates, `.env`
 templates, anything that has to reach a new worktree but must never be committed.
 
+### The two events
+
+| Hook | Runs | Working directory | On failure |
+| --- | --- | --- | --- |
+| `pre-add` | Before `wtree add` does anything at all | The repo root | The worktree is **not** created, and `post-add` never runs |
+| `post-add` | Once the worktree exists and is on its branch | The new worktree | Reported, never rolled back |
+
+`pre-add` is a gate. Use it for the checks that make a worktree pointless if they fail — a
+missing credential, a service that isn't up, a stale cache to warm first. Because it runs
+before the fetch and before `git worktree add`, a `no` costs nothing. Both hooks still run
+every action before deciding, so one broken precondition can't hide a second one behind it.
+
 ### How actions run
 
-Every action runs **from the root of the new worktree**, each in its own subshell. A `cd`
-inside one action does not leak into the next, so action 3 above starts back at the worktree
-root, not in `api/`. That also means `../.wtree/...` reliably points at the config directory.
+Every action runs in **its own subshell**, rooted at the directory in the table above. A `cd`
+inside one action does not leak into the next, so `cd api && npm ci` above starts back at the
+worktree root, not in `api/`. That also means `../.wtree/...` reliably points at the config
+directory from a `post-add` action.
+
+Each action gets the context in its environment:
+
+| Variable | Example |
+| --- | --- |
+| `WTREE_EVENT` | `pre-add` or `post-add` |
+| `WTREE_NAME` | `feature/login` — as typed on the command line |
+| `WTREE_BRANCH` | `feature/login` |
+| `WTREE_PATH` | `/Users/me/work/acme/feature/login` |
+| `WTREE_ROOT` | `/Users/me/work/acme` |
+
+`pre-add` runs before the worktree exists, so `WTREE_PATH` is where it is *about* to appear —
+which is exactly what a check like "is that directory already in the way?" needs.
 
 Actions run in order, each one timed, with a running total at the end. A failing action is
 reported and the rest still run — a broken `npm ci` shouldn't cost you the config files that
@@ -260,19 +293,28 @@ A clean run ends on one line instead:
 ✅ post-add: 3 action(s) in 2m 41s
 ```
 
-The worktree itself is never rolled back — it exists, it is on the right branch, and you can
-finish the setup by hand.
+For `post-add` the worktree itself is never rolled back — it exists, it is on the right
+branch, and you can finish the setup by hand. For `pre-add` the same list is printed and then
+`add` stops:
+
+```
+❌ Error: pre-add hook failed - worktree not created.
+Fix the actions above, or re-run with --no-hooks to skip them.
+```
 
 ### Notes
 
 - `"type"` currently accepts only `"bash"`, and defaults to it when omitted. Any other value
   is reported as a failed action rather than silently skipped.
 - Hooks need `jq`. If `.wtree/config.json` exists and `jq` doesn't, `wtree add` says so and
-  carries on without running anything.
+  carries on without running anything — a missing tool is not a reason to refuse you a
+  worktree, so this never gates `pre-add` the way a failing action does.
 - Invalid JSON is reported with jq's own parse error, and no actions run.
 - An unrecognised key under `"hooks"` gets a warning — a hook nobody runs otherwise looks
   exactly like a hook that passed.
-- `wtree add <worktree> --no-hooks` skips the whole thing for one run.
+- An empty `"actions": []` is silent, so the scaffold `init` writes costs you nothing until
+  you fill it in.
+- `wtree add <worktree> --no-hooks` skips both hooks for one run.
 - Durations come from bash's `$SECONDS`, so they are whole seconds; anything faster than a
   second reads as `<1s`. Enough to tell `npm ci` from a `cp`, which is the point.
 
