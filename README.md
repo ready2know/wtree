@@ -39,7 +39,7 @@ eval "$(wtree shell-init)"   # in ~/.zshrc or ~/.bashrc
 (A child process can't change its parent's directory, so `cd` is the one command that
 needs a shell function wrapping it. Everything else works without the hook.)
 
-Optional: `herdr` and `jq`, only for the `herdr-agent` command.
+Optional: `jq`, for [hooks](#hooks) and the `herdr-agent` command, plus `herdr` itself for the latter.
 
 ## Layout
 
@@ -50,6 +50,7 @@ the repo and every subdirectory is a worktree:
 acme/
 ├── .bare/            the bare clone — all git objects live here
 ├── .git              file containing "gitdir: ./.bare"
+├── .wtree/           optional: config.json and any files your hooks copy around
 ├── main/             worktree on branch main
 ├── feature/login/    worktree on branch feature/login
 └── spike-caching/    worktree on branch spike-caching
@@ -78,7 +79,7 @@ sit there), which keeps the layout above intact.
 | Command | What it does |
 | --- | --- |
 | `wtree init <owner>/<repo>` | Bare-clone into the current empty directory and wire up remote tracking |
-| `wtree add <worktree>` | Create a worktree. Checks out `origin/<worktree>` if it exists, otherwise branches off main/master |
+| `wtree add <worktree>` | Create a worktree. Checks out `origin/<worktree>` if it exists, otherwise branches off main/master, then runs the `post-add` [hook](#hooks) |
 | `wtree remove <worktree>` | Remove a worktree and delete its local branch |
 | `wtree ls` \| `list` | Table of worktrees with branch, dirty state and ahead/behind counts |
 | `wtree sync [<worktree>]` | Fetch, then fast-forward one worktree — or all of them |
@@ -96,9 +97,10 @@ sit there), which keeps the layout above intact.
 ### add
 
 ```
-wtree add <worktree> [-c <branch>] [-p]
+wtree add <worktree> [-c <branch>] [-p] [--no-hooks]
   -c, --custom-branch <branch>   Base the new branch on <branch> instead of main/master
   -p, --print-path               Print only the worktree path on stdout
+      --no-hooks                 Skip the post-add hook for this run
 ```
 
 Three cases, in order: if the branch already exists locally it is checked out (and wired
@@ -112,6 +114,9 @@ default branch with `--no-track`.
 ```bash
 cd "$(wtree add feature/login -p)"
 ```
+
+Hook output goes to stderr under `-p`, so the pipe above still gets a bare path even when
+the hook is running `npm ci`.
 
 ### remove
 
@@ -199,6 +204,77 @@ With `--down`/`--right` it splits the current pane and starts the agent there. W
 direction it looks for an idle, agent-free pane in the current tab, and falls back to
 taking over the current pane. Requires `herdr` and `jq`, and only works from inside a
 herdr pane.
+
+## Hooks
+
+A fresh worktree is rarely ready to work in. It has no `node_modules`, no gitignored config
+files, no local certificates — the things a `git clone` never carries. Hooks are the list of
+commands that close that gap, run for you every time `wtree add` creates a worktree.
+
+They live in `<repo-root>/.wtree/config.json`, next to `.bare`, so every worktree in the
+setup shares one copy:
+
+```json
+{
+  "hooks": {
+    "post-add": {
+      "actions": [
+        { "type": "bash", "command": "cp ../.wtree/secrets/.env ./.env" },
+        { "type": "bash", "command": "pnpm install" },
+        { "type": "bash", "command": "cd api && npm ci" }
+      ]
+    }
+  }
+}
+```
+
+`.wtree/` is a good home for the files the hook hands out, too — certificates, `.env`
+templates, anything that has to reach a new worktree but must never be committed.
+
+### How actions run
+
+Every action runs **from the root of the new worktree**, each in its own subshell. A `cd`
+inside one action does not leak into the next, so action 3 above starts back at the worktree
+root, not in `api/`. That also means `../.wtree/...` reliably points at the config directory.
+
+Actions run in order, each one timed, with a running total at the end. A failing action is
+reported and the rest still run — a broken `npm ci` shouldn't cost you the config files that
+would have been copied afterwards. Failures are collected and listed at the end, and
+`wtree add` exits non-zero if there were any:
+
+```
+🪝 post-add - running 3 action(s) in /Users/me/work/acme/feature/login
+  [1/3] cp ../.wtree/secrets/.env ./.env
+        ✔ <1s
+  [2/3] pnpm install
+        ✘ exit 1 (4s)
+  [3/3] cd api && npm ci
+        ✔ 1m 12s
+⚠️  post-add: 1 of 3 action(s) failed, 1m 16s total:
+     [2] exit 1 after 4s - pnpm install
+```
+
+A clean run ends on one line instead:
+
+```
+✅ post-add: 3 action(s) in 2m 41s
+```
+
+The worktree itself is never rolled back — it exists, it is on the right branch, and you can
+finish the setup by hand.
+
+### Notes
+
+- `"type"` currently accepts only `"bash"`, and defaults to it when omitted. Any other value
+  is reported as a failed action rather than silently skipped.
+- Hooks need `jq`. If `.wtree/config.json` exists and `jq` doesn't, `wtree add` says so and
+  carries on without running anything.
+- Invalid JSON is reported with jq's own parse error, and no actions run.
+- An unrecognised key under `"hooks"` gets a warning — a hook nobody runs otherwise looks
+  exactly like a hook that passed.
+- `wtree add <worktree> --no-hooks` skips the whole thing for one run.
+- Durations come from bash's `$SECONDS`, so they are whole seconds; anything faster than a
+  second reads as `<1s`. Enough to tell `npm ci` from a `cp`, which is the point.
 
 ## Environment variables
 
